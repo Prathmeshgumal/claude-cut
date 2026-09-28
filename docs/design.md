@@ -10,7 +10,7 @@ This document turns [architecture.md](architecture.md) into a buildable design. 
 | --- | --- | --- |
 | Output format | 9:16 vertical, 1080×1920 | For Reels and Shorts. 16:9 comes later |
 | Video length | Up to 10 minutes; designed and tested around 5 minutes | See the scale targets in section 2 |
-| Frame rate | 30 fps by default, 60 fps chosen when a project is created | Fixed for the life of a project |
+| Frame rate | 30 fps by default; 24 fps (film look) or 60 fps chosen when a project is created | Fixed for the life of a project |
 | Export presets | 1080×1920 @ 30, 1080×1920 @ 60, 1440×2560 @ 60 | 2K/60 is for final export only |
 | Long videos | Split into chapters; Claude works one chapter at a time | Section 7 and 11 |
 | Export | Rendered in chunks; only changed chunks are re-rendered | Section 15 |
@@ -19,8 +19,11 @@ This document turns [architecture.md](architecture.md) into a buildable design. 
 | Claude billing (assumed) | Anthropic API key for the in-app chat | Check the Agent SDK docs for the current sign-in options |
 | Where it runs (assumed) | On your own computer: the app runs in the browser at `localhost` | Media stays on disk; no uploads |
 | Music (assumed) | Tracks you add yourself, plus a small bundled library of free sound effects | A licensed music library can come later; see section 14 |
+| Quality bar | The edit analysed in [reference-analysis.md](reference-analysis.md): cuts on the beat, film-credit text, text behind people, one consistent look | Used as a test target |
+| Aspect ratio support | The composition supports 9:16 and 16:9; 9:16 is the default | Whether 16:9 is also in v1 is open question 9 |
+| Generated footage (optional) | You can connect video and image generation services with your own API keys; every generation needs your approval | Section 18 |
 
-Items marked "assumed" are proposals; see [Open questions](#20-open-questions).
+Items marked "assumed" are proposals; see [Open questions](#22-open-questions).
 
 ## 2. Goals and non-goals
 
@@ -45,7 +48,7 @@ Items marked "assumed" are proposals; see [Open questions](#20-open-questions).
 
 **Non-goals for v1**
 
-- Generating realistic new footage. The video is always made from your real clips; the app only arranges them and adds text, graphics, music and sound on top.
+- Claude generating footage itself. The video is made from your real clips; the app arranges them and adds text, graphics, music and sound on top. If you connect a generation service with your own API key, Claude can propose generated clips, which you approve one by one (section 18).
 - Videos longer than 10 minutes.
 - More than one person editing at once, or cloud hosting.
 - Color grading beyond a single project-wide look (LUT).
@@ -116,9 +119,13 @@ claude-cut/
 ├── apps/
 │   ├── editor/          # Vite + React UI
 │   └── server/          # local Node server: UI and media, WebSocket, import and export jobs, Claude chat (Agent SDK)
+│       └── providers/   # optional generation services (section 18), one adapter per service
 ├── mcp-server/          # MCP server exposing edit tools (stdio)
-├── analysis/            # Python worker: ffmpeg, faster-whisper, PySceneDetect, librosa
-├── assets/sfx/          # bundled sound effects with a free license (whoosh, pop, click, riser, …)
+├── analysis/            # Python worker: ffmpeg, faster-whisper, PySceneDetect, librosa, person masks, shot report
+├── assets/
+│   ├── sfx/             # bundled sound effects with a free license (whoosh, pop, click, riser, …)
+│   ├── luts/            # bundled looks (.cube files)
+│   └── fonts/           # bundled fonts with an open license for titles and captions
 ├── prompts/
 │   ├── editing-rules.md # the editing rules; shared by the in-app chat and the plugin's skill
 │   └── actions/         # rough-cut.md, transitions.md, captions.md, music.md, graphics.md, fix.md
@@ -130,7 +137,8 @@ claude-cut/
 ├── docs/
 └── examples/
     ├── sample-project/  # small test project with 5 short clips and 1 song
-    └── long-project/    # generated 10-minute, 200-segment project for performance tests
+    ├── long-project/    # generated 10-minute, 200-segment project for performance tests
+    └── reference-edit/  # the 15 shots of the reference edit, when we have rights to use them (docs/reference-analysis.md)
 ```
 
 ## 6. Project folder on disk
@@ -152,6 +160,8 @@ my-day/
 │   └── proxies/          # 540p copies used for preview
 ├── metadata/<clipId>.json
 ├── frames/<clipId>/      # 1 frame per second (JPEG, 512 px tall) + contact.jpg
+├── masks/<segmentId>/    # person masks for "text behind people" (section 16.3)
+├── generated/            # clips and images from generation services, with generated/<id>.json (prompt, service, cost)
 ├── music/                # songs you add, plus music/<trackId>.analysis.json
 ├── cache/chunks/         # rendered export chunks, named by their fingerprint (section 15)
 └── exports/
@@ -167,7 +177,7 @@ All times are **integer frames** at the project's fps. The schema is defined onc
 type Timeline = {
   schemaVersion: 1;
   version: number;                 // increments on every write
-  settings: { fps: 30 | 60; width: 1080; height: 1920; lut?: string };
+  settings: { fps: 24 | 30 | 60; aspect: "9:16" | "16:9"; look: Look };   // width/height follow from aspect + preset
   story: string;                   // the user's brief
   chapters: Chapter[];             // in order; every segment belongs to exactly one
   video: VideoSegment[];           // ordered, back-to-back (no gaps in v1)
@@ -192,8 +202,14 @@ type VideoSegment = {
   clipVolume: number;              // 0–1
   natSound?: boolean;              // bring the clip's own sound up over the music (section 14)
   transitionIn?: { type: "cut" | "crossfade" | "dip-black" | "slide" | "zoom" | "whip"; frames: number };
-  crop?: { x: number; y: number; scale: number };   // reframing a 16:9 clip into 9:16
+  crop?: { x: number; y: number; scale: number };   // reframing, e.g. a 16:9 clip into 9:16
+  pushIn?: { from: number; to: number };            // slow digital zoom across the segment (scale, e.g. 1.0 → 1.06)
+  stabilize?: boolean;                              // use the stabilized copy of the clip (section 9)
+  grade?: ClipGrade;                                // per-clip colour correction (section 17)
 };
+
+type Look = { lut?: string; lutStrength: number; grain: number; vignette: number };
+type ClipGrade = { exposure: number; temperature: number; tint: number; saturation: number; contrast: number };
 
 type AudioItem =
   | { id: string; role: "music"; trackId: string; start: number; in: number; out: number;
@@ -208,7 +224,10 @@ type Caption = { id: string; start: number; end: number; text: string;
                  words?: { text: string; start: number; end: number }[] };
 
 type Graphic = { id: string; component: GraphicName; start: number; frames: number;
-                 props: Record<string, unknown> };
+                 props: Record<string, unknown>;
+                 position?: { x: number; y: number; anchor: "left" | "center" | "right" };  // 0–1 of the frame
+                 behindSubject?: { segmentId: string };   // draw the segment's person mask over this graphic (section 16.3)
+               };
 
 type Marker = { id: string; frame: number; label: string; kind: "hit" | "note" };
 ```
@@ -222,7 +241,8 @@ type Marker = { id: string; frame: number; label: string; kind: "hit" | "note" }
 - `|audioOffset|` is no more than the length of the segment next to it.
 - Captions don't overlap, and each fits inside the video's length.
 - Music `cuts` lie inside the song, don't overlap, and fall on the song's bar lines (from its analysis).
-- Graphic `props` must match that component's own Zod schema.
+- Graphic `props` must match that component's own Zod schema, and `position` keeps the graphic inside the safe zone for the project's aspect ratio.
+- `behindSubject` needs a finished mask for that segment, and the graphic must lie within the segment's time.
 - Items in `locks` can't be changed or removed unless they are unlocked first.
 - Total length is at most 10 minutes.
 
@@ -275,14 +295,21 @@ The editor server runs import jobs one at a time per project and sends progress 
 | Shots | PySceneDetect (content detector) | shot boundaries |
 | Loudness | `ffmpeg -af ebur128` | integrated LUFS, peak level |
 | Summary | Claude, through `describe_clip` on the contact sheet (optional) | 1–2 sentences + tags |
+| Shot report | camera-shake measure (FFmpeg `vidstabdetect`), exposure and colour-temperature estimate, sharpness | per clip: `steady` / `slightly shaky` / `shaky`, too dark / too bright, blurry; plus exposure and white-balance numbers used for colour matching (section 17) |
+| Stabilized copy | FFmpeg `vidstabtransform` (only for clips marked shaky, or on request) | `normalized/<id>.stab.mp4`, used when a segment has `stabilize: true` |
+| Placement map | per shot: a grid of how busy each area of the frame is (edge density + saliency) over a few sample frames | the calm areas where text can go; used to suggest title and caption positions (section 16.2) |
 
 Converting to a constant frame rate is required, because phone footage usually has a variable frame rate, which makes frame-exact cuts drift.
+
+**Shot report in the app:** clip cards show a small badge (steady, shaky, dark, blurry). Claude reads the report too: it prefers steady, well-exposed takes, suggests stabilizing shaky clips it wants to use, and tells you when a part of the story has no usable shot. Editing can't fully fix footage, so the report is how you find out early.
+
+**Person masks** are not made on import, because they're slow. They are made on request for the few segments that use "text behind people" (section 16.3).
 
 **Songs** (details in section 14.2)
 
 | Step | Tool | Output |
 | --- | --- | --- |
-| Tempo, beats, bars | librosa beat tracking + a downbeat tracker | BPM, beat times, bar start times |
+| Tempo, beats, bars | librosa beat tracking + a downbeat tracker, run for each of the top tempo candidates | 2–3 tempo candidates, each with beat and bar times; one marked as chosen (section 14.2) |
 | Sections | librosa structure analysis (repeating parts) | approximate intro / verse / chorus / outro boundaries |
 | Energy | loudness per beat | an energy curve: where the song builds, drops and calms down |
 | Vocals | vocal-presence detection (optional source separation) | where the song has singing, which clashes with speech |
@@ -321,7 +348,9 @@ A 10-minute project can have 250 segments and an hour of transcripts, far too mu
 | `get_clip(clipId)` | full metadata, including the transcript |
 | `get_frames(clipId, frames[])` | up to 8 images (reuses existing frames or extracts new ones) |
 | `get_timeline({ chapterId } \| { fromFrame, toFrame } \| { overview: true })` | one chapter or range in full, with worked-out start times; `overview` gives one line per segment for the whole video |
-| `get_music(trackId)` | tempo, bars, sections, energy curve and vocal ranges of a song |
+| `get_music(trackId)` | tempo candidates, bars, sections, energy curve and vocal ranges of a song |
+| `get_shot_report(clipId?)` | steadiness, exposure, sharpness per clip |
+| `get_placement(segmentId)` | the calm areas of the shot, best first, as frame positions |
 | `get_comments(status?)` | open comments with segment id, frame and text |
 | `list_versions(limit)`, `diff_versions(a, b)` | history and changes |
 
@@ -340,7 +369,12 @@ A 10-minute project can have 250 segments and an hour of transcripts, far too mu
 | `add_caption(...)` · `update_caption(id, ...)` · `remove_caption(id)` | |
 | `generate_captions(chapterId \| segmentIds, style)` | from the transcript's word timings; at most 2 lines, about 32 characters per line |
 | Music and sound | see section 14.5 |
-| `add_graphic(component, start, frames, props)` · `update_graphic(id, props)` | |
+| `add_graphic(component, start, frames, props, position?)` · `update_graphic(id, props, position?)` | |
+| `add_credit_titles(segmentIds, credits[])` | one credit per segment, placed in each shot's calm area (section 16.2) |
+| `request_mask(segmentId)` · `set_behind_subject(graphicId, on)` | text behind people (section 16.3) |
+| `set_stabilize(segmentId, on)` · `set_push_in(segmentId, from, to)` | |
+| `set_look(look)` · `set_grade(segmentId, grade)` · `match_colour(segmentIds, referenceSegmentId)` | section 17 |
+| `propose_generation(...)` | section 18; creates a proposal you approve, never runs on its own |
 | `lock(ids)` · `unlock(ids)` | normally done by you in the app; Claude uses them only when asked |
 | `restore_version(v)` | |
 | `resolve_comment(id, reply)` | |
@@ -478,7 +512,13 @@ On import, each song gets `music/<trackId>.analysis.json`:
 ```json
 {
   "trackId": "trk_02", "file": "sunny-morning.mp3", "durationFrames": 5400,
-  "bpm": 104, "beats": [12, 29, 46, …], "bars": [12, 81, 150, …],
+  "tempo": {
+    "chosen": 0,
+    "candidates": [
+      { "bpm": 144, "confidence": 0.61, "beats": [11, 21, 31, …], "bars": [11, 51, 91, …] },
+      { "bpm": 96,  "confidence": 0.58, "beats": [12, 27, 42, …], "bars": [12, 72, 132, …] }
+    ]
+  },
   "sections": [ { "label": "intro", "start": 0, "end": 690 },
                 { "label": "A", "start": 690, "end": 2070 },
                 { "label": "B", "start": 2070, "end": 3450, "energy": "high" } ],
@@ -491,6 +531,12 @@ On import, each song gets `music/<trackId>.analysis.json`:
 
 Section labels are approximate (A, B, … for parts that repeat), not exact "verse" and "chorus".
 
+**Tempo can be detected wrongly.** Beat detectors often lock onto the wrong pulse, such as two-thirds or half of the real tempo. On the reference edit, standard detection said 96 BPM, while every cut actually sat on a 144 BPM grid (see [reference-analysis.md](reference-analysis.md)). So:
+
+- analysis keeps the top 2–3 tempo candidates, each with its own beat and bar grid;
+- the music row on the timeline shows the chosen grid, and you can switch to another candidate or **tap the tempo** while the song plays;
+- before snapping cuts, Claude checks the grid: if strong musical accents (onsets) keep falling between the grid's beats, it tells you and suggests the other candidate.
+
 ### 14.3 The music action
 
 Music runs in small steps, like everything else:
@@ -502,6 +548,7 @@ Music runs in small steps, like everything else:
    - **Lengthen:** if it's too short, repeat a section on bar lines, or continue with a second song.
    - **Change songs:** a crossfade of 1–2 bars on a downbeat, or a hard stop on a cut, sometimes with a sound effect or a moment of silence.
 3. **Cut to the music.** In montage parts, move cuts onto beats, within ±3 frames by default, using downbeats for bigger changes. Line up hit points with strong beats or with section changes (a drop, or a chorus starting). Talking parts are left alone: speech matters more than the beat.
+   - **Rhythm patterns:** shot lengths are chosen in whole beats, and the pattern can build. The reference edit uses 8- and 6-beat shots, then 4-beat shots near the end so the energy rises, then holds the final shot. Claude can propose a pattern per chapter ("steady 8s", "build to 4s", "alternate 6 and 2").
 4. **Mix.**
    - **Ducking:** lower the music under speech (12–18 dB by default), with a smooth attack and release, deeper when the song has vocals.
    - **Natural sound breaks:** for a laugh, a splash or a door slam, briefly bring up the clip's own sound over the music (`natSound`).
@@ -524,6 +571,7 @@ Music runs in small steps, like everything else:
 | Tool | Main inputs | Does |
 | --- | --- | --- |
 | `get_music(trackId)` | | song analysis (read-only) |
+| `set_music_tempo(trackId, candidate \| bpm + firstBeat)` | | picks another tempo candidate or a tapped tempo; beat and bar grids are recomputed |
 | `place_music(trackId, start, in)` | | adds a song to the timeline |
 | `fit_music(id, endFrame, method)` | method: `backtime`, `bar-cuts` or `fade` | makes the song end at `endFrame` |
 | `set_music_cuts(id, cuts[])` | | removes or repeats bars by hand |
@@ -560,16 +608,54 @@ A 10-minute video at 30 fps is 18,000 frames, and rendering every frame through 
 
 Chunks render in parallel, up to the number of CPU cores. Old chunks are cleaned up when the cache passes a size limit. If exports are still too slow, Remotion Lambda can render chunks in the cloud later.
 
-## 16. Captions and motion graphics
+## 16. Captions, titles and motion graphics
 
-**Caption safe zone for 9:16 (approximate):** keep text between 13% and 75% of the height, and at least 6% from the left and right edges, so the platform's buttons and profile name don't cover it. The preview can show these guides. The numbers are adjustable per platform preset.
+### 16.1 Captions
+
+**Safe zones (approximate):** for 9:16, keep text between 13% and 75% of the height and at least 6% from the left and right edges, so the platform's buttons and profile name don't cover it. For 16:9, keep text inside the central 90% of the frame. The preview can show these guides, and the numbers are adjustable per platform preset.
 
 **Styles in v1:** `clean` (white text with a subtle shadow), `bold-pop` (large text with a word-by-word pop-in), `karaoke` (the current word highlighted).
 
-**Graphics library in v1.** Each is a React component with a Zod schema for its props. They are drawn on top of your footage, or shown full-screen as a filler:
+### 16.2 Credit titles and text placement
+
+The reference edit's titles are a big part of its quality: a small, widely letter-spaced label above a bold name, placed in the calm part of each shot, appearing and disappearing with the cut.
+
+**`CreditTitle` component**
+
+| Prop | Meaning |
+| --- | --- |
+| `label` | the small line, e.g. "Directed by" (optional) |
+| `name` | the main line, e.g. "Ninad Konde" |
+| `style` | a named style: font, sizes, letter spacing, weight, colour, shadow; `film-credit` matches the reference |
+| `enter` / `exit` | `cut` (default: appears and disappears with the shot), `fade` (6 frames) or `rise` (a small upward move) |
+| `align` | left, centre or right, following where it's placed |
+
+**Automatic placement**
+
+1. The placement map from import (section 9) marks the calm areas of each shot: sky, road, walls, dark corners.
+2. `add_credit_titles` places one title per segment in the best calm area that doesn't cover the main subject, inside the safe zone.
+3. It varies the position from shot to shot (top-left, centre, bottom-right, …) so the sequence feels designed rather than stamped.
+4. You can drag any title in the preview to move it; the new position is saved as an edit like any other.
+
+The same placement map is used to keep captions and other graphics off faces and busy areas.
+
+### 16.3 Text behind people
+
+In the reference edit, a man walks in front of the word PEDESTRIANS. To do this:
+
+1. **Mask:** `request_mask(segmentId)` runs a person-segmentation model on the frames of that segment, locally, and saves a greyscale mask video to `masks/<segmentId>/`. This is slow, roughly minutes for a few seconds of video on a laptop CPU and much faster with a GPU, so it runs only for segments that need it, in the background, with progress shown.
+2. **Layers:** the composition draws the clip, then the text, then the clip again, cut out by the mask so only the person is visible. The person then appears in front of the text.
+3. **Review:** the preview can show the mask edge. Hair, motion blur and fast movement can leave rough edges; if a shot doesn't look right, turn the effect off for it.
+
+The segmentation model will be chosen when we build this. It must run locally and have a license that allows use in this app. v1 masks only people; other foreground objects can come later.
+
+### 16.4 Graphics library
+
+Each graphic is a React component with a Zod schema for its props. It is drawn on top of your footage, or shown full-screen as a filler:
 
 | Component | Use | Main props |
 | --- | --- | --- |
+| `CreditTitle` | film-style credits, section 16.2 | label, name, style |
 | `TitleCard` | opening title, chapter titles | text, subtitle, theme |
 | `LowerThird` | naming a place or person | title, subtitle |
 | `MapRoute` | "home → office" moments | from, to, style |
@@ -580,7 +666,74 @@ Chunks render in parallel, up to the number of CPU cores. Old chunks are cleaned
 
 A **filler** segment is a graphic shown full-screen as its own segment, for example a "Later that day…" card.
 
-## 17. Testing
+## 17. Colour and look
+
+Shots filmed at different times of day and with different settings look inconsistent when cut together. The reference edit has one warm, film-like look on every shot.
+
+- **Project look** (`settings.look`): a LUT (a bundled look from `assets/luts/` or your own `.cube` file) with a strength setting, plus film grain and a vignette.
+- **Per-clip correction** (`grade` on a segment): exposure, colour temperature, tint, saturation and contrast.
+- **Colour matching:** `match_colour(segmentIds, referenceSegmentId)` uses the exposure and white-balance measurements from the shot report to bring the chosen shots close to a reference shot. Claude proposes it after the rough cut; you review it like any change.
+- **Motion:** `set_push_in` adds a slow digital zoom that makes static shots feel alive; `set_stabilize` uses the stabilized copy of a shaky clip. Motion blur from a slow shutter can be imitated on chosen clips by blending neighbouring frames when the clip is prepared, but it looks best when filmed that way.
+- **Frame rate:** 24 fps is offered for a film feel.
+
+**How it's rendered:** the composition applies the correction and the LUT in a WebGL layer, so the preview and the export look the same. Export chunks that take the FFmpeg fast path (section 15.1) apply the same look with FFmpeg's colour filters (`lut3d` and colour adjustments). Rendering tests check that both paths match within a small tolerance; if they don't, that chunk uses the Remotion path.
+
+## 18. Generated media (optional, with your own API keys)
+
+Sometimes a video needs a shot you didn't film: an establishing shot of the city at dawn, a sky time-lapse, a stylised intro, or one more second of a shot to reach the next beat. You can connect **generation services** with your own API keys. Claude can then propose generated clips, and nothing is generated or paid for without your approval.
+
+### 18.1 What it's for
+
+| Use | Kind of service |
+| --- | --- |
+| B-roll you didn't film: scenery, weather, time-lapses, objects | text-to-video |
+| Extending a shot by 1–2 seconds, or animating a still photo | image-to-video (from a frame of your clip, or a photo) |
+| Backgrounds for title cards, stylised intro and outro | text-to-image, text-to-video |
+| Sharper footage, or smooth slow motion | upscaling, frame interpolation |
+| Narration, if you don't want to record it | text-to-speech |
+| Music, if you don't have a track | music generation |
+
+It is **not** for replacing your real moments. By default, Claude doesn't propose realistic footage of real, identifiable people, including you.
+
+### 18.2 How it works
+
+1. **Connect a service** in Settings: choose the service and enter its API key. Keys are stored locally (in the system keychain where available) and used only by the local server; they are never sent to the browser or to Claude. You set a spending limit per project.
+2. **Proposal:** when Claude thinks a generated shot would help, it calls `propose_generation({ kind, prompt, referenceFrame?, seconds, aspect, purpose, placeAfter? })`. This only creates a proposal card in the chat, showing the prompt, the service, the length and the **estimated cost**.
+3. **Your decision:** edit the prompt, approve or reject. You can also ask for a generated shot yourself ("add a 3-second sunrise over the city before the first shot").
+4. **Generation:** the server sends the job to the service. Jobs can take minutes, so progress shows in the chat and you can keep editing.
+5. **Import:** the result is saved to `generated/` with a record of the prompt, service, cost and date, then goes through the same import steps as your clips: normalizing, proxy, frames, shot report. It is colour-matched to the project's look.
+6. **Placement:** it goes into the media bin marked as generated, and onto the timeline if the proposal said where. You review it like any other change. Trying again is a new proposal, because each attempt costs money.
+
+**Service adapters:** each service gets a small adapter in `apps/server/providers/` with a common interface:
+
+```ts
+interface GenerationProvider {
+  id: string; name: string;
+  kinds: ("text-to-video" | "image-to-video" | "text-to-image" | "upscale" | "interpolate" | "voice" | "music")[];
+  limits: { maxSeconds?: number; aspects?: string[] };
+  estimate(req: GenerationRequest): Promise<{ costUsd?: number; seconds?: number }>;
+  submit(req: GenerationRequest): Promise<string>;           // returns a job id
+  status(jobId: string): Promise<"queued" | "running" | "done" | "failed">;
+  download(jobId: string, dest: string): Promise<void>;
+}
+```
+
+Video-generation services, their prices and their APIs change often, so no service is built in. The first adapters are chosen when we build this (open question 10), and adding another service means writing one adapter.
+
+### 18.3 Rules
+
+- Nothing is generated without your approval, and the estimated cost is always shown first. Generation stops at the project's spending limit.
+- Generated clips are marked in the bin and on the timeline, and their record (prompt, service, cost) is kept with the project.
+- Platforms increasingly require you to disclose realistic AI-generated content. When a video contains generated footage, the export dialog lists those clips and reminds you to check the platform's rules.
+- Each service's own content rules and terms apply.
+
+### 18.4 Limits
+
+- Generated footage often doesn't match your camera's look, lens and lighting. It works best for short (2–5 s) establishing shots, transitions and stylised moments, colour-matched to the rest.
+- People, hands and on-screen text in generated video often look wrong.
+- Generation is slow and paid per second of output, so long generated sequences are expensive.
+
+## 19. Testing
 
 | Level | What | How |
 | --- | --- | --- |
@@ -589,47 +742,57 @@ A **filler** segment is a graphic shown full-screen as its own segment, for exam
 | MCP | tool inputs and outputs, error codes, `TOO_LARGE` limits | tool-call tests against the MCP SDK's in-memory transport |
 | Chat | request → Agent SDK run → WebSocket events; Stop; only our tools allowed | server tests with the Agent SDK replaced by a scripted fake; one real run against the sample project before each release |
 | Analysis | expected metadata for the sample clips and song | pytest with tolerances (shot boundaries within 2 frames, beats within 2 frames, BPM within 1) |
+| Tempo | the right tempo is among the candidates | a set of songs with known tempos, including the reference edit's song (144 BPM, not 96) |
 | Music | fitting, bar cuts, beat snapping, ducking envelopes | unit tests on `packages/core` music ops; listening check of the sample project before each release |
-| Rendering | frames look as expected; fast-path and Remotion chunks match | render specific frames of a fixed timeline and compare images, allowing small differences |
+| Rendering | frames look as expected; fast-path and Remotion chunks match, including colour | render specific frames of a fixed timeline and compare images, allowing small differences |
 | Export cache | only changed chunks re-render; joins are seamless | change one caption in `long-project` and check that exactly one chunk re-renders and the output has no glitches at chunk edges |
 | Performance | the scale targets in section 2 | `long-project` (10 min, 200 segments): preview responsiveness, full export time, re-export time |
+| Generation | proposals, approval, cost limit, import of results | server tests with a fake provider; no real paid calls in automated tests |
+| Reference edit | the quality bar | re-create the reference edit from its shots (when we have rights to use them) and compare cut timing, title placement and look |
 | End to end | import → rough cut → music → export | a script that drives the MCP tools against the sample project and checks the MP4's length, fps, size and loudness |
 
-## 18. Milestones
+## 20. Milestones
 
 | # | Milestone | Done when |
 | --- | --- | --- |
 | M1 | Core and store | Schema (with chapters), operations, store with locking, changelog and checkpoints; unit and store tests pass |
-| M2 | Import and analysis | Importing the sample project creates normalized copies, proxies, frames and metadata, plus song analysis; re-importing is instant |
+| M2 | Import and analysis | Importing the sample project creates normalized copies, proxies, frames, metadata, shot report and placement maps, plus song analysis with tempo candidates; re-importing is instant |
 | M3 | Editor preview | The app shows the bin, timeline with zoom and mini-map, and live preview; drag, trim and lock work; outside changes appear within 1 second; `long-project` plays smoothly |
 | M4 | MCP server and in-app chat | In the app, **Chapters** and **Rough cut** on the sample project produce reviewable versions with progress streamed into the chat; **Ask Claude…** on one segment changes only that segment; **Fix my comments** resolves a comment; Stop works |
-| M5 | Captions | Captions from the transcript in 3 styles, inside the safe zone |
-| M6 | Music and sound | Music plan, backtiming, bar cuts, beat snapping, ducking, natural sound breaks, sound effects |
-| M7 | Transitions and graphics | The transitions list, J/L cuts, the 7 graphics components |
-| M8 | Export | All 3 presets; chunk cache and fast path; the output measures -14 LUFS ±1; scale targets in section 2 met or re-agreed |
-| M9 | Terminal plugin | The same actions work as slash commands in Claude Code |
+| M5 | Captions and credit titles | Captions from the transcript in 3 styles; `CreditTitle` with automatic placement; titles can be dragged |
+| M6 | Music and sound | Music plan, tempo candidates and tap tempo, backtiming, bar cuts, beat snapping with rhythm patterns, ducking, natural sound breaks, sound effects |
+| M7 | Look, transitions and graphics | Project look, per-clip correction and colour matching; stabilization and push-ins; the transitions list, J/L cuts, the graphics components |
+| M8 | Text behind people | Masks on request; text drawn behind people; mask-edge preview |
+| M9 | Export | All presets; chunk cache and fast path (with matching colour); the output measures -14 LUFS ±1; scale targets in section 2 met or re-agreed; the reference-edit test passes |
+| M10 | Terminal plugin | The same actions work as slash commands in Claude Code |
+| M11 | Generation services (optional) | One video-generation adapter; proposals with cost, approval, spending limit, import and colour matching of results |
 
-## 19. Risks
+## 21. Risks
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
 | Export of long videos is slow | Long waits | Chunk cache, FFmpeg fast path, parallel chunks; Remotion Lambda later if needed |
 | Visible or audible glitches where chunks join | Broken output | Chunks split only at hard cuts; identical encoder settings; audio rendered in one piece; export-cache tests |
+| Fast-path and Remotion colour don't match | Visible jumps in colour between chunks | Rendering tests compare both paths; fall back to the Remotion path when they differ |
 | Remotion is slow when decoding many clips | Slow preview | Proxies; only segments near the playhead load; `OffthreadVideo` |
 | Claude can't hear the music | Songs that don't fit the mood | You choose or confirm songs; Claude uses the analysis and your mood notes |
-| Beat and section detection is wrong on some songs | Cuts off the beat | Show beats and sections on the timeline so they're easy to check; you can nudge the grid |
-| Claude's first cuts feel generic | Weak videos | Editing rules in `prompts/`; the story brief; chapters; review of each layer |
+| Wrong tempo detected | Cuts off the beat | Several tempo candidates, a visible grid, tap tempo, and Claude checks the grid before snapping (section 14.2) |
+| Masks have rough edges | "Text behind people" looks fake | Use only on chosen shots; mask-edge preview; easy to turn off per shot |
+| Footage isn't cinematic | Well edited but not "film-like" | Shot report, stabilization, push-ins and colour matching; be clear that filming quality matters |
+| Claude's first cuts feel generic | Weak videos | Editing rules in `prompts/`; the story brief; chapters; review of each layer; the reference edit as a test |
 | Large projects overflow Claude's context | Confused or failed runs | Overview + one chapter at a time; `TOO_LARGE` errors instead of huge responses |
-| API costs add up on long projects | Unexpected bill | Summaries before details; frames only when needed; token usage shown after each run; a spending limit set on the API key |
+| API costs add up (Claude or generation services) | Unexpected bill | Summaries before details; frames only when needed; token usage shown after each run; generation needs approval with a cost estimate and a spending limit |
+| Generated shots don't match the footage | Jarring clips | Keep them short; colour-match them; use them for establishing shots and transitions |
+| Generation services change or shut down | Broken feature | One small adapter per service; nothing else depends on a specific service |
 | Agent SDK options change | Chat breaks after an update | Pin the SDK version; keep the command-line fallback (section 12.4) |
 | Frames sampled once per second miss quick action | Bad cut points | `get_frames` at chosen frames; shot boundaries |
 | You and Claude edit at the same time | Lost work | Version check + lock (section 8) |
 | Copyrighted music | Muted or blocked videos | Warning for songs without a license note; recommend licensed music |
 | Remotion license | Cost if used by a company | Free for individuals and small teams; check before commercial use |
-| Whisper is slow on CPU with an hour of footage | Slow import | `small` model by default; `base` model option; clips become usable one by one |
-| Disk space | Projects of several GB | Show disk use; normalized copies and proxies can be deleted and rebuilt |
+| Whisper and masks are slow on CPU | Slow import and effects | Smaller models by default; masks only on request; work runs in the background |
+| Disk space | Projects of several GB | Show disk use; normalized copies, stabilized copies and proxies can be deleted and rebuilt |
 
-## 20. Open questions
+## 22. Open questions
 
 1. Is running on your own computer (the app at `localhost`) right for v1, or do you need a hosted web app with uploads?
 2. Music: only tracks you add, or a licensed library too?
@@ -639,3 +802,6 @@ A **filler** segment is a graphic shown full-screen as its own segment, for exam
 6. Is an Anthropic API key for the in-app chat OK, or should Claude run on your subscription (which may mean keeping the terminal as the main way in)?
 7. Do your videos mostly use instrumental music, or songs with vocals? Vocals under speech need deeper ducking and more careful placement.
 8. Are the scale targets in section 2 right? For example, is a first full export of about 15 minutes for a 5-minute video acceptable?
+9. The reference edit is 16:9. Should v1 support 16:9 as well as 9:16, and which should be the default?
+10. Which generation services do you want to use first?
+11. Can we use the reference edit's shots for testing (section 19)? We'd need the creator's permission.
