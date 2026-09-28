@@ -11,12 +11,13 @@ This document turns [architecture.md](architecture.md) into a buildable design. 
 | Output format | 9:16 vertical, 1080×1920 | For Reels and Shorts. 16:9 comes later |
 | Frame rate | 30 fps by default, 60 fps chosen when a project is created | Fixed for the life of a project |
 | Export presets | 1080×1920 @ 30, 1080×1920 @ 60, 1440×2560 @ 60 | 2K/60 is for final export only |
-| Claude ↔ app (v1) | Shared project folder; you give instructions in the Claude Code terminal | No direct connection between the app and Claude |
-| Claude ↔ app (v2) | Chat panel in the app, run through the Claude Agent SDK | Uses the same MCP tools |
+| Where you give instructions | A chat panel inside the app; the editor server runs Claude through the Claude Agent SDK | See [section 12](#12-in-app-chat-claude-agent-sdk). Uses the same MCP tools |
+| Claude Code terminal | Still supported through the plugin, for people who prefer it | Same tools, same rules |
+| Claude billing (assumed) | Anthropic API key for the in-app chat | Check the Agent SDK docs for the current sign-in options |
 | Where it runs (assumed) | On your own computer: the app runs in the browser at `localhost` | Media stays on disk; no uploads |
 | Music (assumed) | Tracks you add yourself | A royalty-free library can come later |
 
-Items marked "assumed" are proposals; see [Open questions](#18-open-questions).
+Items marked "assumed" are proposals; see [Open questions](#19-open-questions).
 
 ## 2. Goals and non-goals
 
@@ -39,20 +40,23 @@ Items marked "assumed" are proposals; see [Open questions](#18-open-questions).
 1. **Create a project:** choose a name and frame rate. A project folder is created.
 2. **Import clips:** drag clips into the media bin. Analysis runs in the background, and a progress bar shows for each clip.
 3. **Arrange and brief:** drag clips into story order on the timeline and write the story in the Story panel.
-4. **Rough cut:** in Claude Code, run `/rough-cut`. Claude trims each clip and removes dead air, then summarizes what it did, listing segment ids.
+4. **Rough cut:** click **Rough cut** in the chat panel (or type an instruction). Claude trims each clip and removes dead air while its progress streams into the chat, then summarizes what it did, listing segment ids.
 5. **Review:** changed segments are highlighted. Play them, leave comments on specific segments, and approve (lock) the ones you like.
-6. **Later layers:** `/transitions`, `/captions`, `/music` and `/graphics`, each followed by the same review.
-7. **Fixes:** `/fix` makes Claude read your open comments and change only those segments.
-8. **Export:** `/export 1080p30` (or use the button in the app) writes the MP4 to `exports/`.
+6. **Later layers:** **Transitions**, **Captions**, **Music** and **Graphics**, each followed by the same review.
+7. **Fixes:** right-click a segment and choose **Ask Claude…**, or click **Fix my comments** so Claude handles your open comments and changes only those segments.
+8. **Export:** the **Export** button writes the MP4 to `exports/`.
+
+Everything above also works from the Claude Code terminal through the plugin's slash commands (section 11).
 
 ## 4. System overview
 
 ```mermaid
 flowchart LR
-    subgraph Claude Code
+    subgraph TERM["Claude Code terminal (optional)"]
       CC[Claude + plugin<br/>skill, commands]
     end
     subgraph Local machine
+      AG[Claude Agent SDK<br/>inside the editor server]
       MCP[mcp-server]
       CORE[packages/core<br/>schema + ops + store]
       SRV[editor server<br/>HTTP + WebSocket + file watch]
@@ -61,6 +65,10 @@ flowchart LR
       FS[(project folder)]
     end
     CC -- MCP tool calls --> MCP
+    UI -- chat messages + context --> SRV
+    SRV -- runs --> AG
+    AG -- MCP tool calls --> MCP
+    AG -- streamed progress --> SRV
     MCP --> CORE
     SRV --> CORE
     CORE -- atomic writes --> FS
@@ -73,6 +81,8 @@ flowchart LR
 
 The key design choice: **all edits, whether made by Claude or by you, go through one shared library, `packages/core`.** It holds the schema, every edit operation and the only code that writes `timeline.json`. So both sides follow the same rules, and the MCP server keeps working even when the app is closed.
 
+You normally talk to Claude in the app's chat panel: the editor server runs Claude through the Agent SDK, connected to the same MCP server. The Claude Code terminal is an optional second way in, using the same tools.
+
 ## 5. Repository layout
 
 A pnpm monorepo, TypeScript everywhere except the analysis worker.
@@ -84,10 +94,13 @@ claude-cut/
 │   └── composition/     # Remotion compositions: renders a timeline; used by both preview and export
 ├── apps/
 │   ├── editor/          # Vite + React UI
-│   └── server/          # local Node server: serves the UI and media, WebSocket, import jobs, export jobs
+│   └── server/          # local Node server: serves the UI and media, WebSocket, import and export jobs, Claude chat (Agent SDK)
 ├── mcp-server/          # MCP server exposing edit tools (stdio)
 ├── analysis/            # Python worker: ffmpeg, faster-whisper, PySceneDetect, librosa
-├── plugin/
+├── prompts/
+│   ├── editing-rules.md # the editing rules; shared by the in-app chat and the plugin's skill
+│   └── actions/         # rough-cut.md, transitions.md, captions.md, music.md, graphics.md, fix.md
+├── plugin/              # optional: the same features for the Claude Code terminal
 │   ├── .claude-plugin/plugin.json
 │   ├── .mcp.json        # starts mcp-server
 │   ├── skills/video-editing/SKILL.md
@@ -108,6 +121,7 @@ my-day/
 │   └── ...
 ├── changelog.jsonl       # one line per version: {version, author, note, ops, time}
 ├── comments.json         # comments pinned to segments
+├── chat.json             # Agent SDK session id + chat history shown in the panel
 ├── media/
 │   ├── originals/        # files as imported (never modified)
 │   ├── normalized/       # constant-frame-rate copies used for editing and export
@@ -293,11 +307,13 @@ Successful edits return `{ version, changedIds, summary }`. Errors return a code
 | `CONFLICT` | the timeline changed meanwhile | re-read, then try again |
 | `BUSY` | another write is in progress | try again |
 
-## 11. Plugin contents
+## 11. Editing rules, actions and the plugin
+
+The editing rules and the actions (rough cut, captions, …) are written once in `prompts/` and used in two places: the in-app chat (section 12) and the Claude Code plugin. The plugin is optional; it gives the same features to anyone who prefers the terminal.
 
 - **`plugin.json`**: name, version, description.
 - **`.mcp.json`**: starts `node mcp-server/dist/index.js`.
-- **Skill `video-editing`**: when to use each tool, and editing rules:
+- **Editing rules** (`prompts/editing-rules.md`, also shipped as the plugin's skill `video-editing`): when to use each tool, plus:
   - Open with the strongest moment. The first 3 seconds decide whether people keep watching.
   - Shots of 1–3 seconds for montage parts, and longer for talking parts.
   - Trim at pauses in speech (the `silences` in the metadata) and at shot changes.
@@ -305,27 +321,63 @@ Successful edits return `{ version, changedIds, summary }`. Errors return a code
   - Mostly hard cuts. Use at most one style of fancy transition per video, and only where the story changes.
   - Music around -20 LUFS under speech, -14 LUFS for the final mix.
   - Change only what you were asked to. End each step with a list of changed segment ids.
-- **Commands**: each command file tells Claude what to read, which tools it may use, and to stop for review at the end.
+- **Actions**: each action file tells Claude what to read, which tools it may use, and to stop for review at the end. In the app each action is a button; in the terminal it's a slash command.
 
-| Command | Does |
-| --- | --- |
-| `/rough-cut` | Reads the story, `list_clips` and the current order; trims and removes dead air in one `apply_edits` |
-| `/transitions` | Adds transitions and J/L cuts only where they help; changes nothing else |
-| `/captions [style]` | `generate_captions`, then fixes wording and line breaks |
-| `/music <file>` | Places the music, snaps cuts to the beat within 3 frames, turns on ducking |
-| `/graphics` | Suggests at most 3 graphics or fillers and waits for your OK before adding them |
-| `/fix` | Handles open comments one by one and resolves each with a reply |
-| `/export <preset>` | Calls the editor server's export endpoint |
+| App button | Terminal command | Does |
+| --- | --- | --- |
+| Rough cut | `/rough-cut` | Reads the story, `list_clips` and the current order; trims and removes dead air in one `apply_edits` |
+| Transitions | `/transitions` | Adds transitions and J/L cuts only where they help; changes nothing else |
+| Captions | `/captions [style]` | `generate_captions`, then fixes wording and line breaks |
+| Music | `/music <file>` | Places the music, snaps cuts to the beat within 3 frames, turns on ducking |
+| Graphics | `/graphics` | Suggests at most 3 graphics or fillers and waits for your OK before adding them |
+| Fix my comments | `/fix` | Handles open comments one by one and resolves each with a reply |
+| Export | `/export <preset>` | Calls the editor server's export endpoint |
 
-## 12. Editor app
+## 12. In-app chat (Claude Agent SDK)
+
+You give Claude instructions inside the editor. The editor server runs Claude with the **Claude Agent SDK** (`@anthropic-ai/claude-agent-sdk`), which is Claude Code packaged as a library: the same agent, tool calling and sessions, controlled from our code.
+
+### 12.1 Flow
+
+1. You type in the chat panel, click an action button, or right-click a segment and choose **Ask Claude…**.
+2. The app sends `POST /api/chat` with `{ text, action?, context }`. `context` holds the selected segment ids, the current `version`, the playhead frame and the ids of any open comments.
+3. The server starts an Agent SDK run with:
+   - our MCP server (section 10), so Claude uses exactly the same checked tools;
+   - `prompts/editing-rules.md` plus the action's file as instructions;
+   - a short context block made from `context`, for example "The user selected seg_07 at frame 312; the timeline is at version 42";
+   - permission for **our MCP tools only**: no shell and no file editing, so Claude can only change the video through the checked tools;
+   - the project's saved session id, so the conversation continues across messages.
+4. The server forwards the SDK's messages to the app over the WebSocket as `chat:event` messages (text, "calling trim_segment…", results, errors). Edits land through `packages/core` as usual, so the preview updates live.
+5. When the run ends, the server saves the session id and the visible chat history to `chat.json`.
+
+### 12.2 Behavior
+
+- **One run at a time per project.** While Claude is working, the chat input shows a **Stop** button, and your manual edits still work (conflicts are handled as in section 8.3).
+- **Stop** cancels the run. Edits already saved stay saved and can be undone as usual.
+- **Every chat reply ends with the changed segment ids**, and they're clickable, so you jump straight to reviewing them.
+- **Frames cost the most tokens**, so the rules tell Claude to use metadata and contact sheets first, and `get_frames` only when it needs a closer look.
+- **Errors** (no API key, rate limit, network) appear in the chat with a clear message; nothing in the timeline changes.
+
+### 12.3 Sign-in and cost
+
+The Agent SDK normally uses an **Anthropic API key**, set in the app's settings and kept in the local server's environment, never sent to the browser. It is billed per use, separately from a Claude subscription. Check the Agent SDK documentation for the current sign-in options before building. The settings screen shows the token usage of the last run, so costs stay visible.
+
+### 12.4 Fallback
+
+If the Agent SDK turns out not to fit, the server can run the Claude Code command line in non-interactive mode (`claude -p … --output-format stream-json`) with the plugin enabled and forward its output to the chat panel. The app side stays the same.
+
+## 13. Editor app
 
 **Layout** (built for a laptop screen, at least 1280 px wide)
 
 ```
 ┌───────────────┬───────────────────────────────┬─────────────────┐
-│ Media bin      │  Preview (9:16 Remotion Player) │ Story / Comments │
-│ clip cards     │  play, frame step, safe-zone     │ / History tabs   │
-│ with progress  │  guides on/off                   │                  │
+│ Media bin      │  Preview (9:16 Remotion Player) │ Claude / Story / │
+│ clip cards     │  play, frame step, safe-zone     │ Comments /       │
+│ with progress  │  guides on/off                   │ History tabs     │
+│                │                                  │ (Claude: chat,   │
+│                │                                  │ action buttons,  │
+│                │                                  │ Stop)            │
 ├───────────────┴───────────────────────────────┴─────────────────┤
 │ Timeline: video row · captions row · graphics row · music row    │
 │ (waveform) · changed items highlighted · lock icons · playhead    │
@@ -340,10 +392,11 @@ Successful edits return `{ version, changedIds, summary }`. Errors return a code
 - The preview uses the same composition as export (`packages/composition`) with a `useProxies` flag.
 - Comments: click a segment, press `C`, and type. The comment is saved with the segment id and the current frame.
 - History tab: a list of the changelog. Click a version to play it; "Restore" restores it with `restore_version`.
+- Claude tab: the chat (section 12). Claude's messages stream in; segment ids in its replies are links that select and play that segment. Right-clicking a segment on the timeline opens **Ask Claude…** with that segment already attached.
 
-**Keyboard shortcuts:** space to play or pause, J/K/L for playback speed, ←/→ to move one frame, C to comment, L to lock, ⌘Z to undo (restores the previous version).
+**Keyboard shortcuts:** space to play or pause, J/K/L for playback speed, ←/→ to move one frame, C to comment, L to lock, ⌘K to ask Claude about the selection, ⌘Z to undo (restores the previous version).
 
-## 13. Rendering
+## 14. Rendering
 
 - **One composition:** `packages/composition` turns a `Timeline` into Remotion layers: video segments, crossfades, graphics, captions and audio. The preview and the export use the same code, so what you see is what you get.
 - **Audio:** each segment's audio is shifted by `audioOffset`. Ducking lowers the music volume by 12 dB, with a 6-frame fade, wherever there is speech (from the metadata `speech` ranges).
@@ -351,7 +404,7 @@ Successful edits return `{ version, changedIds, summary }`. Errors return a code
 - **Presets:** `1080p30`, `1080p60`, `1440p60`. 1440p scales the composition by 4/3; clips from the phone keep their native resolution when it's high enough.
 - **Progress** is sent over the WebSocket, and the export can be cancelled.
 
-## 14. Captions and motion graphics
+## 15. Captions and motion graphics
 
 **Caption safe zone for 9:16 (approximate):** keep text between 13% and 75% of the height, and at least 6% from the left and right edges, so the platform's buttons and profile name don't cover it. The preview can show these guides. The numbers are adjustable per platform preset.
 
@@ -371,45 +424,49 @@ Successful edits return `{ version, changedIds, summary }`. Errors return a code
 
 A **filler** segment is a graphic shown full-screen as its own segment, for example a "Later that day…" card.
 
-## 15. Testing
+## 16. Testing
 
 | Level | What | How |
 | --- | --- | --- |
 | Unit | every operation and every rule in `packages/core` | Vitest; property tests (fast-check) that check random edit sequences always produce a valid timeline |
 | Store | locking, conflicts, atomic writes | Vitest with two writers running at once against a temporary folder |
 | MCP | tool inputs and outputs, error codes | tool-call tests against the MCP SDK's in-memory transport |
+| Chat | request → Agent SDK run → WebSocket events; Stop; only our tools allowed | server tests with the Agent SDK replaced by a scripted fake; one real run against the sample project before each release |
 | Analysis | expected metadata for `examples/sample-project` | pytest with tolerances (for example, shot boundaries within 2 frames) |
 | Rendering | frames look as expected | render specific frames of a fixed timeline and compare images, allowing small differences |
 | End to end | import → rough cut → export | a script that drives the MCP tools against the sample project and checks the MP4's length, fps, size and loudness |
 
-## 16. Milestones
+## 17. Milestones
 
 | # | Milestone | Done when |
 | --- | --- | --- |
 | M1 | Core and store | Schema, operations, store with locking and versions; unit and store tests pass |
 | M2 | Import and analysis | Importing the sample project creates normalized copies, proxies, frames and metadata; re-importing is instant |
 | M3 | Editor preview | The app shows the bin, timeline and live preview; drag, trim and lock work; outside changes to `timeline.json` appear within 1 second |
-| M4 | MCP and plugin | In Claude Code, `/rough-cut` on the sample project produces a reviewable version, and `/fix` resolves a comment |
+| M4 | MCP server and in-app chat | In the app, **Rough cut** on the sample project produces a reviewable version with progress streamed into the chat; **Ask Claude…** on one segment changes only that segment; **Fix my comments** resolves a comment; Stop works |
 | M5 | Captions and music | Captions from the transcript, ducking, beat snapping |
 | M6 | Transitions and graphics | The transitions list, J/L cuts, the 7 graphics components |
 | M7 | Export | All 3 presets; the output measures -14 LUFS ±1; the end-to-end test passes |
-| M8 (v2) | Chat panel in the app | Agent SDK chat and "Ask Claude about this segment" |
+| M8 | Terminal plugin | The same actions work as slash commands in Claude Code |
 
-## 17. Risks
+## 18. Risks
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
 | Remotion is slow when decoding many clips | Slow previews and exports | Proxies for preview; `OffthreadVideo`; Remotion Lambda later if needed |
-| Claude's first cuts feel generic | Weak videos | Editing rules in the skill; the story brief; review of each layer |
+| Claude's first cuts feel generic | Weak videos | Editing rules in `prompts/`; the story brief; review of each layer |
+| API costs add up | Unexpected bill | Metadata and contact sheets before full frames; token usage shown after each run; a spending limit set on the API key |
+| Agent SDK options change | Chat breaks after an update | Pin the SDK version; keep the command-line fallback (section 12.4) |
 | Frames sampled once per second miss quick action | Bad cut points | `get_frames` at chosen frames; shot boundaries |
 | You and Claude edit at the same time | Lost work | Version check + lock (section 8) |
 | Remotion license | Cost if used by a company | Free for individuals and small teams; check before commercial use |
 | Whisper is slow on CPU | Slow import | `small` model by default; `base` model option; import runs in the background |
 
-## 18. Open questions
+## 19. Open questions
 
 1. Is running on your own computer (the app at `localhost`) right for v1, or do you need a hosted web app with uploads?
 2. Music: only tracks you add, or a royalty-free library too?
 3. Should Claude be able to suggest a clip order itself, or does it always keep yours?
 4. Do you want to support reframing 16:9 clips into 9:16 (the `crop` field) in v1, or can we assume all clips are vertical?
 5. Which caption style should be the default?
+6. Is an Anthropic API key for the in-app chat OK, or should Claude run on your subscription (which may mean keeping the terminal as the main way in)?
