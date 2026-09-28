@@ -2,49 +2,65 @@
 
 2026-09-28 · Prathmesh Gumal · Status: draft for review
 
-This document turns [architecture.md](architecture.md) into a buildable design. It covers the repo layout, the timeline format, how edits are stored and synced, the analysis pipeline, the MCP tools Claude uses, the editor app, rendering, testing and milestones.
+This document turns [architecture.md](architecture.md) into a buildable design. It covers the repo layout, the timeline format, how edits are stored and synced, the analysis pipeline, the MCP tools Claude uses, the in-app chat, the editor app, music and sound, rendering, testing and milestones.
 
 ## 1. Decisions so far
 
 | Topic | Decision | Notes |
 | --- | --- | --- |
 | Output format | 9:16 vertical, 1080×1920 | For Reels and Shorts. 16:9 comes later |
+| Video length | Up to 10 minutes; designed and tested around 5 minutes | See the scale targets in section 2 |
 | Frame rate | 30 fps by default, 60 fps chosen when a project is created | Fixed for the life of a project |
 | Export presets | 1080×1920 @ 30, 1080×1920 @ 60, 1440×2560 @ 60 | 2K/60 is for final export only |
+| Long videos | Split into chapters; Claude works one chapter at a time | Section 7 and 11 |
+| Export | Rendered in chunks; only changed chunks are re-rendered | Section 15 |
 | Where you give instructions | A chat panel inside the app; the editor server runs Claude through the Claude Agent SDK | See [section 12](#12-in-app-chat-claude-agent-sdk). Uses the same MCP tools |
 | Claude Code terminal | Still supported through the plugin, for people who prefer it | Same tools, same rules |
 | Claude billing (assumed) | Anthropic API key for the in-app chat | Check the Agent SDK docs for the current sign-in options |
 | Where it runs (assumed) | On your own computer: the app runs in the browser at `localhost` | Media stays on disk; no uploads |
-| Music (assumed) | Tracks you add yourself | A royalty-free library can come later |
+| Music (assumed) | Tracks you add yourself, plus a small bundled library of free sound effects | A licensed music library can come later; see section 14 |
 
-Items marked "assumed" are proposals; see [Open questions](#19-open-questions).
+Items marked "assumed" are proposals; see [Open questions](#20-open-questions).
 
 ## 2. Goals and non-goals
 
 **Goals**
 
-- Turn 10–30 short clips plus a written story into a 30–90 second vertical video.
+- Turn your clips plus a written story into a vertical video of 30 seconds to 10 minutes.
 - Every Claude change is small, has a name, and can be undone.
 - You can review any change in the browser within about 1 second, with no rendering.
 - You and Claude edit the same timeline, and neither silently overwrites the other.
+- A small change to a finished video re-exports in about a minute, not by rendering everything again.
+
+**Scale targets** (to be confirmed with measurements during M7)
+
+| Measure | Target |
+| --- | --- |
+| Final video length | up to 10 min (optimized for about 5 min) |
+| Segments on the timeline | up to 250 |
+| Imported footage | up to about 60 min of source clips, up to 300 files |
+| Preview after an edit | visible within 1 s |
+| First full export, 5 min at 1080p30 | about 15 min or less on a recent laptop |
+| Re-export after changing one caption or segment | about 1 min or less |
 
 **Non-goals for v1**
 
-- Generating realistic new footage.
-- Videos longer than about 3 minutes.
+- Generating realistic new footage. The video is always made from your real clips; the app only arranges them and adds text, graphics, music and sound on top.
+- Videos longer than 10 minutes.
 - More than one person editing at once, or cloud hosting.
 - Color grading beyond a single project-wide look (LUT).
 
 ## 3. User workflow
 
 1. **Create a project:** choose a name and frame rate. A project folder is created.
-2. **Import clips:** drag clips into the media bin. Analysis runs in the background, and a progress bar shows for each clip.
+2. **Import clips and music:** drag clips and songs into the media bin. Analysis runs in the background, and a progress bar shows for each file.
 3. **Arrange and brief:** drag clips into story order on the timeline and write the story in the Story panel.
-4. **Rough cut:** click **Rough cut** in the chat panel (or type an instruction). Claude trims each clip and removes dead air while its progress streams into the chat, then summarizes what it did, listing segment ids.
-5. **Review:** changed segments are highlighted. Play them, leave comments on specific segments, and approve (lock) the ones you like.
-6. **Later layers:** **Transitions**, **Captions**, **Music** and **Graphics**, each followed by the same review.
-7. **Fixes:** right-click a segment and choose **Ask Claude…**, or click **Fix my comments** so Claude handles your open comments and changes only those segments.
-8. **Export:** the **Export** button writes the MP4 to `exports/`.
+4. **Chapters:** Claude suggests chapters from your story and clip order ("Morning", "Commute", "Work", …). You adjust them. For a short video, one chapter is fine.
+5. **Rough cut:** click **Rough cut** in the chat panel (or type an instruction). Claude works one chapter at a time: it trims each clip and removes dead air while its progress streams into the chat, then summarizes what it did, listing segment ids, and waits for your review before the next chapter.
+6. **Review:** changed segments are highlighted. Play them, leave comments on specific segments, and approve (lock) the ones you like.
+7. **Later layers:** **Transitions**, **Captions**, **Music** and **Graphics**, each followed by the same review. For music, Claude first proposes a plan (section 14) and waits for your OK.
+8. **Fixes:** right-click a segment and choose **Ask Claude…**, or click **Fix my comments** so Claude handles your open comments and changes only those segments.
+9. **Export:** the **Export** button writes the MP4 to `exports/`. Later exports re-render only what changed.
 
 Everything above also works from the Claude Code terminal through the plugin's slash commands (section 11).
 
@@ -62,6 +78,7 @@ flowchart LR
       SRV[editor server<br/>HTTP + WebSocket + file watch]
       UI[editor app<br/>React + Remotion Player]
       AN[analysis worker<br/>Python]
+      EXP[export worker<br/>Remotion + FFmpeg, chunk cache]
       FS[(project folder)]
     end
     CC -- MCP tool calls --> MCP
@@ -77,11 +94,15 @@ flowchart LR
     UI -- user edits (HTTP) --> SRV
     SRV -- import jobs --> AN
     AN -- metadata + proxies --> FS
+    SRV -- export jobs --> EXP
+    EXP -- chunks + MP4 --> FS
 ```
 
 The key design choice: **all edits, whether made by Claude or by you, go through one shared library, `packages/core`.** It holds the schema, every edit operation and the only code that writes `timeline.json`. So both sides follow the same rules, and the MCP server keeps working even when the app is closed.
 
 You normally talk to Claude in the app's chat panel: the editor server runs Claude through the Agent SDK, connected to the same MCP server. The Claude Code terminal is an optional second way in, using the same tools.
+
+**What draws the picture:** the video frames always come from your real footage. Remotion (a React library for video) places each clip at the right time, blends clips during transitions, and draws only the extras on top: captions, titles, maps and other graphics.
 
 ## 5. Repository layout
 
@@ -94,9 +115,10 @@ claude-cut/
 │   └── composition/     # Remotion compositions: renders a timeline; used by both preview and export
 ├── apps/
 │   ├── editor/          # Vite + React UI
-│   └── server/          # local Node server: serves the UI and media, WebSocket, import and export jobs, Claude chat (Agent SDK)
+│   └── server/          # local Node server: UI and media, WebSocket, import and export jobs, Claude chat (Agent SDK)
 ├── mcp-server/          # MCP server exposing edit tools (stdio)
 ├── analysis/            # Python worker: ffmpeg, faster-whisper, PySceneDetect, librosa
+├── assets/sfx/          # bundled sound effects with a free license (whoosh, pop, click, riser, …)
 ├── prompts/
 │   ├── editing-rules.md # the editing rules; shared by the in-app chat and the plugin's skill
 │   └── actions/         # rough-cut.md, transitions.md, captions.md, music.md, graphics.md, fix.md
@@ -106,7 +128,9 @@ claude-cut/
 │   ├── skills/video-editing/SKILL.md
 │   └── commands/        # rough-cut.md, transitions.md, captions.md, music.md, graphics.md, fix.md, export.md
 ├── docs/
-└── examples/sample-project/   # small test project with 5 short clips
+└── examples/
+    ├── sample-project/  # small test project with 5 short clips and 1 song
+    └── long-project/    # generated 10-minute, 200-segment project for performance tests
 ```
 
 ## 6. Project folder on disk
@@ -116,10 +140,10 @@ my-day/
 ├── project.json          # name, fps, width, height, created, schemaVersion
 ├── timeline.json         # the current timeline (source of truth)
 ├── timeline.lock         # present only during a write
-├── versions/
-│   ├── v0001.json        # full snapshot per version
-│   └── ...
 ├── changelog.jsonl       # one line per version: {version, author, note, ops, time}
+├── checkpoints/
+│   ├── c0020.json        # full timeline every 20 versions
+│   └── ...
 ├── comments.json         # comments pinned to segments
 ├── chat.json             # Agent SDK session id + chat history shown in the panel
 ├── media/
@@ -128,11 +152,12 @@ my-day/
 │   └── proxies/          # 540p copies used for preview
 ├── metadata/<clipId>.json
 ├── frames/<clipId>/      # 1 frame per second (JPEG, 512 px tall) + contact.jpg
-├── music/
+├── music/                # songs you add, plus music/<trackId>.analysis.json
+├── cache/chunks/         # rendered export chunks, named by their fingerprint (section 15)
 └── exports/
 ```
 
-A snapshot per version is simple and makes undo safe. A 90-second timeline is about 20–50 KB, so 500 versions is only about 25 MB.
+**Disk use:** a 10-minute edit usually comes from 30–60 minutes of phone footage, which is several GB. Normalized copies roughly double that, and proxies add 10–20%. The app shows the project's disk use and can delete normalized copies and proxies, which can be rebuilt from the originals.
 
 ## 7. Timeline schema
 
@@ -144,15 +169,20 @@ type Timeline = {
   version: number;                 // increments on every write
   settings: { fps: 30 | 60; width: 1080; height: 1920; lut?: string };
   story: string;                   // the user's brief
+  chapters: Chapter[];             // in order; every segment belongs to exactly one
   video: VideoSegment[];           // ordered, back-to-back (no gaps in v1)
-  audio: AudioItem[];              // music and sound effects
+  audio: AudioItem[];              // music, sound effects, ambience
   captions: Caption[];
   graphics: Graphic[];             // overlays and fillers
+  markers: Marker[];               // hit points: moments the music should land on
   locks: string[];                 // ids of approved items
 };
 
+type Chapter = { id: string; title: string; note?: string };
+
 type VideoSegment = {
   id: string;                      // "seg_" + short id, never reused
+  chapterId: string;
   kind: "clip" | "filler";
   clipId?: string;                 // for kind "clip"
   graphicId?: string;              // for kind "filler" (a full-screen graphic)
@@ -160,12 +190,18 @@ type VideoSegment = {
   speed: number;                   // 0.25–4
   audioOffset: number;             // J cut (<0) / L cut (>0), in frames
   clipVolume: number;              // 0–1
+  natSound?: boolean;              // bring the clip's own sound up over the music (section 14)
   transitionIn?: { type: "cut" | "crossfade" | "dip-black" | "slide" | "zoom" | "whip"; frames: number };
   crop?: { x: number; y: number; scale: number };   // reframing a 16:9 clip into 9:16
 };
 
-type AudioItem = { id: string; src: string; start: number; in: number; out: number;
-                   volume: number; duckUnderSpeech: boolean; fadeIn: number; fadeOut: number };
+type AudioItem =
+  | { id: string; role: "music"; trackId: string; start: number; in: number; out: number;
+      volume: number; fadeIn: number; fadeOut: number;
+      cuts: { from: number; to: number; crossfade: number }[];   // parts of the song removed, at bar lines
+      duck: { enabled: boolean; depthDb: number; attack: number; release: number } }
+  | { id: string; role: "sfx"; src: string; start: number; volume: number }
+  | { id: string; role: "ambience"; src: string; start: number; frames: number; volume: number };
 
 type Caption = { id: string; start: number; end: number; text: string;
                  style: "clean" | "bold-pop" | "karaoke"; position: "lower" | "center" | "upper";
@@ -173,17 +209,22 @@ type Caption = { id: string; start: number; end: number; text: string;
 
 type Graphic = { id: string; component: GraphicName; start: number; frames: number;
                  props: Record<string, unknown> };
+
+type Marker = { id: string; frame: number; label: string; kind: "hit" | "note" };
 ```
 
 **Rules checked on every write**
 
 - Every id is unique, and ids are never reused, so an id always points to the same thing in comments and in the changelog.
 - Every segment has `in < out`, and its trimmed length fits inside the clip.
+- Every segment belongs to an existing chapter, and each chapter's segments are next to each other.
 - A transition is no longer than half of either segment next to it.
 - `|audioOffset|` is no more than the length of the segment next to it.
 - Captions don't overlap, and each fits inside the video's length.
+- Music `cuts` lie inside the song, don't overlap, and fall on the song's bar lines (from its analysis).
 - Graphic `props` must match that component's own Zod schema.
 - Items in `locks` can't be changed or removed unless they are unlocked first.
+- Total length is at most 10 minutes.
 
 A segment's start time on the timeline isn't stored. It's worked out from the order of the segments and their lengths, which removes a whole class of errors where stored times disagree.
 
@@ -195,7 +236,7 @@ A segment's start time on the timeline isn't stored. It's worked out from the or
 
 Every change is an **operation**: a small JSON command such as `{ op: "trim", id: "seg_07", in: 45, out: 150 }`. `packages/core/ops.ts` has one pure function per operation, `(timeline, args) => timeline`, that throws a typed error when the change isn't allowed.
 
-One write can contain several operations with one note. It's all-or-nothing: if any operation fails, nothing is saved. A rough cut is therefore one version, not 20.
+One write can contain several operations with one note. It's all-or-nothing: if any operation fails, nothing is saved. A chapter's rough cut is therefore one version, not 40.
 
 ### 8.2 Store
 
@@ -204,8 +245,10 @@ One write can contain several operations with one note. It's all-or-nothing: if 
 1. Takes `timeline.lock`, created exclusively. It retries for up to 2 seconds, then fails with `BUSY`.
 2. Reads `timeline.json`. If `version !== baseVersion`, it fails with `CONFLICT` and returns the newer version.
 3. Applies the operations and validates the result against the schema and rules.
-4. Writes `versions/vNNNN.json`, then writes `timeline.json` through a temporary file and a rename, so the file is never half-written. Then it adds a line to `changelog.jsonl`.
+4. Adds a line with the operations to `changelog.jsonl`. Every 20th version it also writes a full copy to `checkpoints/`. Then it writes `timeline.json` through a temporary file and a rename, so the file is never half-written.
 5. Releases the lock and returns `{ version, changedIds }`.
+
+A 10-minute timeline is about 200 KB, so a full copy per version would reach 100 MB after 500 edits. Storing operations plus a checkpoint every 20 versions keeps history small, and any version can still be rebuilt exactly: take the nearest earlier checkpoint and replay the operations after it.
 
 ### 8.3 Conflicts
 
@@ -218,7 +261,9 @@ If you drag a clip while Claude is editing, whichever write lands second gets `C
 
 ## 9. Import and analysis
 
-The editor server runs import jobs one at a time per project and sends progress to the app over the WebSocket. Each step is cached by the file's SHA-256, so re-importing a file does nothing.
+The editor server runs import jobs one at a time per project and sends progress to the app over the WebSocket. Each step is cached by the file's SHA-256, so re-importing a file does nothing. With up to 60 minutes of footage, import can take a while, so clips become usable one by one as they finish.
+
+**Video clips**
 
 | Step | Command (simplified) | Output |
 | --- | --- | --- |
@@ -229,10 +274,19 @@ The editor server runs import jobs one at a time per project and sends progress 
 | Transcript | faster-whisper (`small` model, word timestamps) | words with start and end times |
 | Shots | PySceneDetect (content detector) | shot boundaries |
 | Loudness | `ffmpeg -af ebur128` | integrated LUFS, peak level |
-| Beats (music only) | librosa `beat_track` | beat and downbeat times |
 | Summary | Claude, through `describe_clip` on the contact sheet (optional) | 1–2 sentences + tags |
 
 Converting to a constant frame rate is required, because phone footage usually has a variable frame rate, which makes frame-exact cuts drift.
+
+**Songs** (details in section 14.2)
+
+| Step | Tool | Output |
+| --- | --- | --- |
+| Tempo, beats, bars | librosa beat tracking + a downbeat tracker | BPM, beat times, bar start times |
+| Sections | librosa structure analysis (repeating parts) | approximate intro / verse / chorus / outro boundaries |
+| Energy | loudness per beat | an energy curve: where the song builds, drops and calms down |
+| Vocals | vocal-presence detection (optional source separation) | where the song has singing, which clashes with speech |
+| Loudness | `ffmpeg -af ebur128` | integrated LUFS |
 
 **`metadata/<clipId>.json`**
 
@@ -253,17 +307,21 @@ Converting to a constant frame rate is required, because phone footage usually h
 
 A stdio MCP server written with the TypeScript MCP SDK. It finds the project through the `CLAUDE_CUT_PROJECT` environment variable or the `open_project` tool.
 
+A 10-minute project can have 250 segments and an hour of transcripts, far too much to send to Claude at once. So read tools return **summaries by default and details on request**, and most of them take a chapter or a frame range.
+
 ### 10.1 Tools
 
 **Read tools** (they never change anything)
 
 | Tool | Returns |
 | --- | --- |
-| `open_project(path)` | project settings, clip count, current version |
-| `list_clips()` | id, length, summary and tags per clip, with the transcript shortened |
-| `get_clip(clipId)` | full metadata |
+| `open_project(path)` | project settings, clip count, chapter list, current version |
+| `list_chapters()` | per chapter: title, segment count, length, what's approved |
+| `list_clips(filter?)` | id, length, summary and tags per clip; filter by tag, chapter or "unused"; paged |
+| `get_clip(clipId)` | full metadata, including the transcript |
 | `get_frames(clipId, frames[])` | up to 8 images (reuses existing frames or extracts new ones) |
-| `get_timeline()` | the timeline plus the worked-out start time of each segment |
+| `get_timeline({ chapterId } \| { fromFrame, toFrame } \| { overview: true })` | one chapter or range in full, with worked-out start times; `overview` gives one line per segment for the whole video |
+| `get_music(trackId)` | tempo, bars, sections, energy curve and vocal ranges of a song |
 | `get_comments(status?)` | open comments with segment id, frame and text |
 | `list_versions(limit)`, `diff_versions(a, b)` | history and changes |
 
@@ -272,6 +330,7 @@ A stdio MCP server written with the TypeScript MCP SDK. It finds the project thr
 | Tool | Main inputs |
 | --- | --- |
 | `apply_edits(baseVersion, ops[], note)` | Several operations at once, all-or-nothing |
+| `set_chapters(chapters[])` · `move_to_chapter(segmentIds, chapterId)` | |
 | `insert_segment(clipId, in, out, afterId?)` | |
 | `trim_segment(id, in, out)` · `split_segment(id, atFrame)` · `remove_segment(id)` | |
 | `move_segment(id, afterId)` | |
@@ -279,8 +338,8 @@ A stdio MCP server written with the TypeScript MCP SDK. It finds the project thr
 | `set_transition(id, type, frames)` | |
 | `set_audio_offset(id, frames)` | J/L cuts |
 | `add_caption(...)` · `update_caption(id, ...)` · `remove_caption(id)` | |
-| `generate_captions(segmentIds?, style)` | from the transcript's word timings; at most 2 lines, about 32 characters per line |
-| `set_music(src, start, in, out, volume)` · `set_ducking(id, on)` · `snap_cuts_to_beats(fromId, toId, tolerance)` | |
+| `generate_captions(chapterId \| segmentIds, style)` | from the transcript's word timings; at most 2 lines, about 32 characters per line |
+| Music and sound | see section 14.5 |
 | `add_graphic(component, start, frames, props)` · `update_graphic(id, props)` | |
 | `lock(ids)` · `unlock(ids)` | normally done by you in the app; Claude uses them only when asked |
 | `restore_version(v)` | |
@@ -306,6 +365,7 @@ Successful edits return `{ version, changedIds, summary }`. Errors return a code
 | `INVALID` | a rule was broken (the message names the rule) | fix the values |
 | `CONFLICT` | the timeline changed meanwhile | re-read, then try again |
 | `BUSY` | another write is in progress | try again |
+| `TOO_LARGE` | the request would return too much | ask for one chapter or a smaller range |
 
 ## 11. Editing rules, actions and the plugin
 
@@ -319,17 +379,20 @@ The editing rules and the actions (rough cut, captions, …) are written once in
   - Trim at pauses in speech (the `silences` in the metadata) and at shot changes.
   - Use a J cut (6–12 frames) when the next clip starts with speech, and an L cut to let a reaction play out.
   - Mostly hard cuts. Use at most one style of fancy transition per video, and only where the story changes.
-  - Music around -20 LUFS under speech, -14 LUFS for the final mix.
+  - For longer videos, vary the pace: alternate montage parts with slower talking parts, and give each chapter a clear start.
+  - Work on one chapter at a time. Read the overview first, then only the chapter you're editing.
+  - Music rules are in section 14.
   - Change only what you were asked to. End each step with a list of changed segment ids.
-- **Actions**: each action file tells Claude what to read, which tools it may use, and to stop for review at the end. In the app each action is a button; in the terminal it's a slash command.
+- **Actions**: each action file tells Claude what to read, which tools it may use, and to stop for review at the end. An action runs on the selected chapter, or on each chapter in turn with a pause for review after each. In the app each action is a button; in the terminal it's a slash command.
 
 | App button | Terminal command | Does |
 | --- | --- | --- |
-| Rough cut | `/rough-cut` | Reads the story, `list_clips` and the current order; trims and removes dead air in one `apply_edits` |
+| Chapters | `/chapters` | Suggests chapters from the story and clip order |
+| Rough cut | `/rough-cut` | Reads the story, the chapter's clips and the current order; trims and removes dead air in one `apply_edits` |
 | Transitions | `/transitions` | Adds transitions and J/L cuts only where they help; changes nothing else |
 | Captions | `/captions [style]` | `generate_captions`, then fixes wording and line breaks |
-| Music | `/music <file>` | Places the music, snaps cuts to the beat within 3 frames, turns on ducking |
-| Graphics | `/graphics` | Suggests at most 3 graphics or fillers and waits for your OK before adding them |
+| Music | `/music` | Proposes a music plan, waits for your OK, then places, fits and mixes the music (section 14) |
+| Graphics | `/graphics` | Suggests at most 3 graphics or fillers per chapter and waits for your OK before adding them |
 | Fix my comments | `/fix` | Handles open comments one by one and resolves each with a reply |
 | Export | `/export <preset>` | Calls the editor server's export endpoint |
 
@@ -340,11 +403,11 @@ You give Claude instructions inside the editor. The editor server runs Claude wi
 ### 12.1 Flow
 
 1. You type in the chat panel, click an action button, or right-click a segment and choose **Ask Claude…**.
-2. The app sends `POST /api/chat` with `{ text, action?, context }`. `context` holds the selected segment ids, the current `version`, the playhead frame and the ids of any open comments.
+2. The app sends `POST /api/chat` with `{ text, action?, context }`. `context` holds the selected chapter and segment ids, the current `version`, the playhead frame and the ids of any open comments.
 3. The server starts an Agent SDK run with:
    - our MCP server (section 10), so Claude uses exactly the same checked tools;
    - `prompts/editing-rules.md` plus the action's file as instructions;
-   - a short context block made from `context`, for example "The user selected seg_07 at frame 312; the timeline is at version 42";
+   - a short context block made from `context`, for example "The user selected seg_07 in chapter 'Morning' at frame 312; the timeline is at version 42";
    - permission for **our MCP tools only**: no shell and no file editing, so Claude can only change the video through the checked tools;
    - the project's saved session id, so the conversation continues across messages.
 4. The server forwards the SDK's messages to the app over the WebSocket as `chat:event` messages (text, "calling trim_segment…", results, errors). Edits land through `packages/core` as usual, so the preview updates live.
@@ -356,6 +419,7 @@ You give Claude instructions inside the editor. The editor server runs Claude wi
 - **Stop** cancels the run. Edits already saved stay saved and can be undone as usual.
 - **Every chat reply ends with the changed segment ids**, and they're clickable, so you jump straight to reviewing them.
 - **Frames cost the most tokens**, so the rules tell Claude to use metadata and contact sheets first, and `get_frames` only when it needs a closer look.
+- **Long conversations:** on a 10-minute project the chat can grow long. The Agent SDK manages its context; each action also starts from the overview and the current chapter, so it doesn't depend on old messages.
 - **Errors** (no API key, rate limit, network) appear in the chat with a clear message; nothing in the timeline changes.
 
 ### 12.3 Sign-in and cost
@@ -373,14 +437,16 @@ If the Agent SDK turns out not to fit, the server can run the Claude Code comman
 ```
 ┌───────────────┬───────────────────────────────┬─────────────────┐
 │ Media bin      │  Preview (9:16 Remotion Player) │ Claude / Story / │
-│ clip cards     │  play, frame step, safe-zone     │ Comments /       │
+│ clips + songs  │  play, frame step, safe-zone     │ Comments /       │
 │ with progress  │  guides on/off                   │ History tabs     │
 │                │                                  │ (Claude: chat,   │
 │                │                                  │ action buttons,  │
 │                │                                  │ Stop)            │
 ├───────────────┴───────────────────────────────┴─────────────────┤
-│ Timeline: video row · captions row · graphics row · music row    │
-│ (waveform) · changed items highlighted · lock icons · playhead    │
+│ Mini-map of the whole video with chapter bands                   │
+│ Timeline: video row · captions row · graphics row ·               │
+│ music row (waveform, beat and bar ticks, song sections) ·         │
+│ sfx row · markers · changed items highlighted · locks · playhead  │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -389,28 +455,118 @@ If the Agent SDK turns out not to fit, the server can run the Claude Code comman
 - State is kept with Zustand. The timeline comes from the server; the app never keeps its own copy.
 - You make edits (drag, trim handles, delete, lock) through `POST /api/ops` with `baseVersion`. The server runs the same `packages/core` store.
 - The server watches `timeline.json` and `comments.json` (with chokidar) and sends `timeline:updated {version, changedIds, author, note}` over the WebSocket. The app highlights `changedIds` for 10 seconds, or until you play them.
-- The preview uses the same composition as export (`packages/composition`) with a `useProxies` flag.
+- The preview uses the same composition as export (`packages/composition`) with a `useProxies` flag. Only segments near the playhead load their video, so a 10-minute timeline plays as smoothly as a short one.
+- **Long timelines:** the timeline zooms from the whole video down to single frames; a mini-map with chapter bands shows where you are; only the visible part of the timeline is drawn, so 250 segments stay fast. Clicking a chapter zooms to it.
 - Comments: click a segment, press `C`, and type. The comment is saved with the segment id and the current frame.
 - History tab: a list of the changelog. Click a version to play it; "Restore" restores it with `restore_version`.
 - Claude tab: the chat (section 12). Claude's messages stream in; segment ids in its replies are links that select and play that segment. Right-clicking a segment on the timeline opens **Ask Claude…** with that segment already attached.
 
-**Keyboard shortcuts:** space to play or pause, J/K/L for playback speed, ←/→ to move one frame, C to comment, L to lock, ⌘K to ask Claude about the selection, ⌘Z to undo (restores the previous version).
+**Keyboard shortcuts:** space to play or pause, J/K/L for playback speed, ←/→ to move one frame, C to comment, L to lock, M to add a marker, ⌘K to ask Claude about the selection, ⌘Z to undo (restores the previous version).
 
-## 14. Rendering
+## 14. Music and sound
 
-- **One composition:** `packages/composition` turns a `Timeline` into Remotion layers: video segments, crossfades, graphics, captions and audio. The preview and the export use the same code, so what you see is what you get.
-- **Audio:** each segment's audio is shifted by `audioOffset`. Ducking lowers the music volume by 12 dB, with a 6-frame fade, wherever there is speech (from the metadata `speech` ranges).
-- **Export:** `@remotion/renderer` `renderMedia` with H.264, CRF 18, AAC at 48 kHz and 192 kb/s, from the `normalized/` media. Then a second pass with `ffmpeg loudnorm` to -14 LUFS integrated and -1 dBTP true peak.
+Music does a lot of the storytelling in a day-in-my-life video: it sets the mood of each part of the day, drives the pace of montages, and makes key moments land. This section covers how songs are chosen, analysed, fitted to the edit, and mixed with speech and sound effects.
+
+### 14.1 What Claude can and can't do with music
+
+Claude can't listen to audio. It works from the analysis of each song (tempo, bars, sections, energy, vocals), the title and your description of its mood, and the edit's story and chapters. That is enough for the mechanical parts, like fitting a song to a chapter, cutting on the beat, ducking under speech and ending on the song's real ending. **Choosing the right song for a mood is your call**, or Claude suggests from your descriptions and tags, and you confirm by listening.
+
+### 14.2 Song analysis
+
+On import, each song gets `music/<trackId>.analysis.json`:
+
+```json
+{
+  "trackId": "trk_02", "file": "sunny-morning.mp3", "durationFrames": 5400,
+  "bpm": 104, "beats": [12, 29, 46, …], "bars": [12, 81, 150, …],
+  "sections": [ { "label": "intro", "start": 0, "end": 690 },
+                { "label": "A", "start": 690, "end": 2070 },
+                { "label": "B", "start": 2070, "end": 3450, "energy": "high" } ],
+  "energy": [0.21, 0.24, …],
+  "vocals": [[700, 2000], [2100, 3400]],
+  "lufs": -9.8,
+  "userNotes": "calm, happy, acoustic"
+}
+```
+
+Section labels are approximate (A, B, … for parts that repeat), not exact "verse" and "chorus".
+
+### 14.3 The music action
+
+Music runs in small steps, like everything else:
+
+1. **Plan (no edits yet).** Claude proposes a plan in the chat: which song for which chapters, which part of each song, where songs change, and 2–5 hit points: moments the music should land on, like a reveal, a jump into the pool or the first shot of the evening. You adjust it and approve.
+2. **Place and fit.** For each song:
+   - **Backtime:** line up the song's real ending with the end of its chapter or of the video, so the music ends properly instead of fading out in the middle.
+   - **Shorten:** if the song is too long, remove whole bars or a repeated section (music `cuts`), joined with a short crossfade on a bar line so the edit can't be heard.
+   - **Lengthen:** if it's too short, repeat a section on bar lines, or continue with a second song.
+   - **Change songs:** a crossfade of 1–2 bars on a downbeat, or a hard stop on a cut, sometimes with a sound effect or a moment of silence.
+3. **Cut to the music.** In montage parts, move cuts onto beats, within ±3 frames by default, using downbeats for bigger changes. Line up hit points with strong beats or with section changes (a drop, or a chorus starting). Talking parts are left alone: speech matters more than the beat.
+4. **Mix.**
+   - **Ducking:** lower the music under speech (12–18 dB by default), with a smooth attack and release, deeper when the song has vocals.
+   - **Natural sound breaks:** for a laugh, a splash or a door slam, briefly bring up the clip's own sound over the music (`natSound`).
+   - **Sound effects:** a small number of whooshes on transitions, pops on caption pop-ins, risers before a reveal. Used sparingly.
+   - **Room tone and ambience:** fill tiny gaps so cuts in talking parts don't sound jumpy.
+5. **Review.** Changed segments and audio items are highlighted as usual. You can lock the music once it feels right.
+
+### 14.4 Levels
+
+| Element | Target |
+| --- | --- |
+| Speech | the anchor of the mix; clear and even |
+| Music under speech | 12–18 dB below speech |
+| Music in montage parts (no speech) | full level, close to the final loudness |
+| Sound effects | noticeable but never louder than speech |
+| Final export | -14 LUFS integrated, -1 dBTP true peak (common for social platforms) |
+
+### 14.5 Tools
+
+| Tool | Main inputs | Does |
+| --- | --- | --- |
+| `get_music(trackId)` | | song analysis (read-only) |
+| `place_music(trackId, start, in)` | | adds a song to the timeline |
+| `fit_music(id, endFrame, method)` | method: `backtime`, `bar-cuts` or `fade` | makes the song end at `endFrame` |
+| `set_music_cuts(id, cuts[])` | | removes or repeats bars by hand |
+| `crossfade_music(fromId, toId, bars)` | | changes songs on a downbeat |
+| `snap_cuts_to_beats(chapterId \| range, tolerance, prefer)` | prefer: `beat` or `downbeat` | moves nearby cuts onto the beat; skips locked and talking segments |
+| `add_marker(frame, label)` · `align_to_marker(markerId, musicPoint)` | | hit points |
+| `set_ducking(id, depthDb, attack, release)` | | |
+| `set_nat_sound(segmentId, on)` | | |
+| `add_sfx(name, frame, volume)` | name from `assets/sfx/` | |
+
+### 14.6 Copyright
+
+Commercial songs usually get the video muted, blocked or monetised by someone else on YouTube and Instagram. The app shows a warning when a song has no license note, and the docs recommend royalty-free or licensed music. A licensed library could be connected later (open question 2).
+
+## 15. Rendering
+
+- **One composition:** `packages/composition` turns a `Timeline` into Remotion layers: your real clips, transitions, graphics, captions and audio. The preview and the export use the same code, so what you see is what you get.
 - **Presets:** `1080p30`, `1080p60`, `1440p60`. 1440p scales the composition by 4/3; clips from the phone keep their native resolution when it's high enough.
 - **Progress** is sent over the WebSocket, and the export can be cancelled.
 
-## 15. Captions and motion graphics
+### 15.1 Chunked export with a cache
+
+A 10-minute video at 30 fps is 18,000 frames, and rendering every frame through the browser could take an hour. Re-rendering all of it after a small fix would bring back the original problem. So export works in chunks:
+
+1. **Split** the video into chunks of about 10–20 seconds, always at hard cuts, never inside a transition.
+2. **Fingerprint** each chunk: a hash of everything that affects it, meaning its segments, the captions, graphics and markers that overlap it, the settings, the preset and the composition code version.
+3. **Reuse** any chunk whose fingerprint is already in `cache/chunks/`. Only new or changed chunks are rendered.
+4. **Render** each chunk in the fastest way that is correct:
+   - **Fast path:** a chunk of plain footage (cuts only, no text, graphics or effects) is cut and encoded directly with FFmpeg, roughly 10× faster.
+   - **Remotion path:** anything else uses `renderMedia` with a `frameRange`.
+   - Both paths use identical encoder settings (codec, profile, resolution, fps, pixel format, each chunk starting on a keyframe), so chunks join cleanly.
+5. **Audio** is rendered once for the whole video, not per chunk, from the same composition (music, ducking, J/L cuts, sound effects), so there are no clicks where chunks meet. Audio is fast to render.
+6. **Join** the video chunks with FFmpeg's concat, add the audio, and run `loudnorm` to -14 LUFS integrated and -1 dBTP true peak.
+
+Chunks render in parallel, up to the number of CPU cores. Old chunks are cleaned up when the cache passes a size limit. If exports are still too slow, Remotion Lambda can render chunks in the cloud later.
+
+## 16. Captions and motion graphics
 
 **Caption safe zone for 9:16 (approximate):** keep text between 13% and 75% of the height, and at least 6% from the left and right edges, so the platform's buttons and profile name don't cover it. The preview can show these guides. The numbers are adjustable per platform preset.
 
 **Styles in v1:** `clean` (white text with a subtle shadow), `bold-pop` (large text with a word-by-word pop-in), `karaoke` (the current word highlighted).
 
-**Graphics library in v1.** Each is a React component with a Zod schema for its props:
+**Graphics library in v1.** Each is a React component with a Zod schema for its props. They are drawn on top of your footage, or shown full-screen as a filler:
 
 | Component | Use | Main props |
 | --- | --- | --- |
@@ -424,49 +580,62 @@ If the Agent SDK turns out not to fit, the server can run the Claude Code comman
 
 A **filler** segment is a graphic shown full-screen as its own segment, for example a "Later that day…" card.
 
-## 16. Testing
+## 17. Testing
 
 | Level | What | How |
 | --- | --- | --- |
 | Unit | every operation and every rule in `packages/core` | Vitest; property tests (fast-check) that check random edit sequences always produce a valid timeline |
-| Store | locking, conflicts, atomic writes | Vitest with two writers running at once against a temporary folder |
-| MCP | tool inputs and outputs, error codes | tool-call tests against the MCP SDK's in-memory transport |
+| Store | locking, conflicts, atomic writes, rebuilding versions from checkpoints | Vitest with two writers running at once against a temporary folder |
+| MCP | tool inputs and outputs, error codes, `TOO_LARGE` limits | tool-call tests against the MCP SDK's in-memory transport |
 | Chat | request → Agent SDK run → WebSocket events; Stop; only our tools allowed | server tests with the Agent SDK replaced by a scripted fake; one real run against the sample project before each release |
-| Analysis | expected metadata for `examples/sample-project` | pytest with tolerances (for example, shot boundaries within 2 frames) |
-| Rendering | frames look as expected | render specific frames of a fixed timeline and compare images, allowing small differences |
-| End to end | import → rough cut → export | a script that drives the MCP tools against the sample project and checks the MP4's length, fps, size and loudness |
+| Analysis | expected metadata for the sample clips and song | pytest with tolerances (shot boundaries within 2 frames, beats within 2 frames, BPM within 1) |
+| Music | fitting, bar cuts, beat snapping, ducking envelopes | unit tests on `packages/core` music ops; listening check of the sample project before each release |
+| Rendering | frames look as expected; fast-path and Remotion chunks match | render specific frames of a fixed timeline and compare images, allowing small differences |
+| Export cache | only changed chunks re-render; joins are seamless | change one caption in `long-project` and check that exactly one chunk re-renders and the output has no glitches at chunk edges |
+| Performance | the scale targets in section 2 | `long-project` (10 min, 200 segments): preview responsiveness, full export time, re-export time |
+| End to end | import → rough cut → music → export | a script that drives the MCP tools against the sample project and checks the MP4's length, fps, size and loudness |
 
-## 17. Milestones
+## 18. Milestones
 
 | # | Milestone | Done when |
 | --- | --- | --- |
-| M1 | Core and store | Schema, operations, store with locking and versions; unit and store tests pass |
-| M2 | Import and analysis | Importing the sample project creates normalized copies, proxies, frames and metadata; re-importing is instant |
-| M3 | Editor preview | The app shows the bin, timeline and live preview; drag, trim and lock work; outside changes to `timeline.json` appear within 1 second |
-| M4 | MCP server and in-app chat | In the app, **Rough cut** on the sample project produces a reviewable version with progress streamed into the chat; **Ask Claude…** on one segment changes only that segment; **Fix my comments** resolves a comment; Stop works |
-| M5 | Captions and music | Captions from the transcript, ducking, beat snapping |
-| M6 | Transitions and graphics | The transitions list, J/L cuts, the 7 graphics components |
-| M7 | Export | All 3 presets; the output measures -14 LUFS ±1; the end-to-end test passes |
-| M8 | Terminal plugin | The same actions work as slash commands in Claude Code |
+| M1 | Core and store | Schema (with chapters), operations, store with locking, changelog and checkpoints; unit and store tests pass |
+| M2 | Import and analysis | Importing the sample project creates normalized copies, proxies, frames and metadata, plus song analysis; re-importing is instant |
+| M3 | Editor preview | The app shows the bin, timeline with zoom and mini-map, and live preview; drag, trim and lock work; outside changes appear within 1 second; `long-project` plays smoothly |
+| M4 | MCP server and in-app chat | In the app, **Chapters** and **Rough cut** on the sample project produce reviewable versions with progress streamed into the chat; **Ask Claude…** on one segment changes only that segment; **Fix my comments** resolves a comment; Stop works |
+| M5 | Captions | Captions from the transcript in 3 styles, inside the safe zone |
+| M6 | Music and sound | Music plan, backtiming, bar cuts, beat snapping, ducking, natural sound breaks, sound effects |
+| M7 | Transitions and graphics | The transitions list, J/L cuts, the 7 graphics components |
+| M8 | Export | All 3 presets; chunk cache and fast path; the output measures -14 LUFS ±1; scale targets in section 2 met or re-agreed |
+| M9 | Terminal plugin | The same actions work as slash commands in Claude Code |
 
-## 18. Risks
+## 19. Risks
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
-| Remotion is slow when decoding many clips | Slow previews and exports | Proxies for preview; `OffthreadVideo`; Remotion Lambda later if needed |
-| Claude's first cuts feel generic | Weak videos | Editing rules in `prompts/`; the story brief; review of each layer |
-| API costs add up | Unexpected bill | Metadata and contact sheets before full frames; token usage shown after each run; a spending limit set on the API key |
+| Export of long videos is slow | Long waits | Chunk cache, FFmpeg fast path, parallel chunks; Remotion Lambda later if needed |
+| Visible or audible glitches where chunks join | Broken output | Chunks split only at hard cuts; identical encoder settings; audio rendered in one piece; export-cache tests |
+| Remotion is slow when decoding many clips | Slow preview | Proxies; only segments near the playhead load; `OffthreadVideo` |
+| Claude can't hear the music | Songs that don't fit the mood | You choose or confirm songs; Claude uses the analysis and your mood notes |
+| Beat and section detection is wrong on some songs | Cuts off the beat | Show beats and sections on the timeline so they're easy to check; you can nudge the grid |
+| Claude's first cuts feel generic | Weak videos | Editing rules in `prompts/`; the story brief; chapters; review of each layer |
+| Large projects overflow Claude's context | Confused or failed runs | Overview + one chapter at a time; `TOO_LARGE` errors instead of huge responses |
+| API costs add up on long projects | Unexpected bill | Summaries before details; frames only when needed; token usage shown after each run; a spending limit set on the API key |
 | Agent SDK options change | Chat breaks after an update | Pin the SDK version; keep the command-line fallback (section 12.4) |
 | Frames sampled once per second miss quick action | Bad cut points | `get_frames` at chosen frames; shot boundaries |
 | You and Claude edit at the same time | Lost work | Version check + lock (section 8) |
+| Copyrighted music | Muted or blocked videos | Warning for songs without a license note; recommend licensed music |
 | Remotion license | Cost if used by a company | Free for individuals and small teams; check before commercial use |
-| Whisper is slow on CPU | Slow import | `small` model by default; `base` model option; import runs in the background |
+| Whisper is slow on CPU with an hour of footage | Slow import | `small` model by default; `base` model option; clips become usable one by one |
+| Disk space | Projects of several GB | Show disk use; normalized copies and proxies can be deleted and rebuilt |
 
-## 19. Open questions
+## 20. Open questions
 
 1. Is running on your own computer (the app at `localhost`) right for v1, or do you need a hosted web app with uploads?
-2. Music: only tracks you add, or a royalty-free library too?
+2. Music: only tracks you add, or a licensed library too?
 3. Should Claude be able to suggest a clip order itself, or does it always keep yours?
 4. Do you want to support reframing 16:9 clips into 9:16 (the `crop` field) in v1, or can we assume all clips are vertical?
 5. Which caption style should be the default?
 6. Is an Anthropic API key for the in-app chat OK, or should Claude run on your subscription (which may mean keeping the terminal as the main way in)?
+7. Do your videos mostly use instrumental music, or songs with vocals? Vocals under speech need deeper ducking and more careful placement.
+8. Are the scale targets in section 2 right? For example, is a first full export of about 15 minutes for a 5-minute video acceptable?
