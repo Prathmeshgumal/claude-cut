@@ -589,7 +589,8 @@ Commercial songs usually get the video muted, blocked or monetised by someone el
 ## 15. Rendering
 
 - **One composition:** `packages/composition` turns a `Timeline` into Remotion layers: your real clips, transitions, graphics, captions and audio. The preview and the export use the same code, so what you see is what you get.
-- **Presets:** `1080p30`, `1080p60`, `1440p60`. 1440p scales the composition by 4/3; clips from the phone keep their native resolution when it's high enough.
+- **Presets:** `1080p30`, `1080p60`, `1440p60` (plus `1080p24` for 24 fps projects), in the project's aspect ratio: 1080×1920 or 1920×1080, and 1440×2560 or 2560×1440. 1440p scales the composition by 4/3; clips keep their native resolution when it's high enough.
+- **Layers, bottom to top:** your clips (with correction, look and transitions), graphics and titles, the clip again cut out by a person mask where "text behind people" is used, captions, then grain and vignette.
 - **Progress** is sent over the WebSocket, and the export can be cancelled.
 
 ### 15.1 Chunked export with a cache
